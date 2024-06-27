@@ -1,0 +1,745 @@
+
+#include <common/types.h>
+#include <gdt.h>
+#include <memorymanagement.h>
+#include <hardwarecommunication/interrupts.h>
+#include <syscalls.h>
+#include <hardwarecommunication/pci.h>
+#include <drivers/driver.h>
+#include <drivers/keyboard.h>
+#include <drivers/mouse.h>
+#include <drivers/vga.h>
+#include <drivers/ata.h>
+#include <gui/desktop.h>
+#include <gui/window.h>
+#include <multitasking.h>
+
+#include <drivers/amd_am79c973.h>
+#include <net/etherframe.h>
+#include <net/arp.h>
+#include <net/ipv4.h>
+#include <net/icmp.h>
+#include <net/udp.h>
+#include <net/tcp.h>
+
+#include <rng.h>
+
+// #define GRAPHICSMODE
+
+using namespace myos;
+using namespace myos::common;
+using namespace myos::drivers;
+using namespace myos::hardwarecommunication;
+using namespace myos::gui;
+using namespace myos::net;
+
+bool newLinePressed = false;
+
+uint16_t *VideoMemory = (uint16_t *)0xb8000;
+uint8_t screenx = 0, screeny = 0;
+GlobalDescriptorTable gdt;
+TaskManager taskManager;
+
+void clearScreen()
+{
+    for (; screeny < 25; screeny++)
+        for (; screenx < 80; screenx++)
+            VideoMemory[80 * screeny + screenx] = (VideoMemory[80 * screeny + screenx] & 0xFF00) | ' ';
+    screenx = 0;
+    screeny = 0;
+}
+
+void printf(char *str)
+{
+
+    for (int i = 0; str[i] != '\0'; ++i)
+    {
+        switch (str[i])
+        {
+        case '\n':
+            screenx = 0;
+            screeny++;
+            break;
+        default:
+            VideoMemory[80 * screeny + screenx] = (VideoMemory[80 * screeny + screenx] & 0xFF00) | str[i];
+            screenx++;
+            break;
+        }
+
+        if (screenx >= 80)
+        {
+            screenx = 0;
+            screeny++;
+        }
+
+        if (screeny >= 25)
+        {
+            taskManager.WaitEnter();
+            while (!newLinePressed)
+                ;
+            newLinePressed = false;
+            taskManager.SignalEnter();
+            for (screeny = 0; screeny < 25; screeny++)
+                for (screenx = 0; screenx < 80; screenx++)
+                    VideoMemory[80 * screeny + screenx] = (VideoMemory[80 * screeny + screenx] & 0xFF00) | ' ';
+            screenx = 0;
+            screeny = 0;
+        }
+    }
+}
+
+void printfHex(uint8_t key)
+{
+    char *foo = "00";
+    char *hex = "0123456789ABCDEF";
+    foo[0] = hex[(key >> 4) & 0xF];
+    foo[1] = hex[key & 0xF];
+    printf(foo);
+}
+void printfHex16(uint16_t key)
+{
+    printfHex((key >> 8) & 0xFF);
+    printfHex(key & 0xFF);
+}
+void printfHex32(uint32_t key)
+{
+    printfHex((key >> 24) & 0xFF);
+    printfHex((key >> 16) & 0xFF);
+    printfHex((key >> 8) & 0xFF);
+    printfHex(key & 0xFF);
+}
+
+class PrintfKeyboardEventHandler : public KeyboardEventHandler
+{
+public:
+    void OnKeyDown(char c)
+    {
+        // char *foo = " ";
+        // foo[0] = c;
+        // printf(foo);
+
+        if (c == '\n')
+        {
+            newLinePressed = true;
+        }
+    }
+};
+
+class MouseToConsole : public MouseEventHandler
+{
+    int8_t x, y;
+
+public:
+    MouseToConsole()
+    {
+        uint16_t *VideoMemory = (uint16_t *)0xb8000;
+        x = 40;
+        y = 12;
+        VideoMemory[80 * y + x] = (VideoMemory[80 * y + x] & 0x0F00) << 4 | (VideoMemory[80 * y + x] & 0xF000) >> 4 | (VideoMemory[80 * y + x] & 0x00FF);
+    }
+
+    virtual void OnMouseMove(int xoffset, int yoffset)
+    {
+        static uint16_t *VideoMemory = (uint16_t *)0xb8000;
+        VideoMemory[80 * y + x] = (VideoMemory[80 * y + x] & 0x0F00) << 4 | (VideoMemory[80 * y + x] & 0xF000) >> 4 | (VideoMemory[80 * y + x] & 0x00FF);
+
+        x += xoffset;
+        if (x >= 80)
+            x = 79;
+        if (x < 0)
+            x = 0;
+        y += yoffset;
+        if (y >= 25)
+            y = 24;
+        if (y < 0)
+            y = 0;
+
+        VideoMemory[80 * y + x] = (VideoMemory[80 * y + x] & 0x0F00) << 4 | (VideoMemory[80 * y + x] & 0xF000) >> 4 | (VideoMemory[80 * y + x] & 0x00FF);
+    }
+};
+
+class PrintfUDPHandler : public UserDatagramProtocolHandler
+{
+public:
+    void HandleUserDatagramProtocolMessage(UserDatagramProtocolSocket *socket, common::uint8_t *data, common::uint16_t size)
+    {
+        char *foo = " ";
+        for (int i = 0; i < size; i++)
+        {
+            foo[0] = data[i];
+            printf(foo);
+        }
+    }
+};
+
+class PrintfTCPHandler : public TransmissionControlProtocolHandler
+{
+public:
+    bool HandleTransmissionControlProtocolMessage(TransmissionControlProtocolSocket *socket, common::uint8_t *data, common::uint16_t size)
+    {
+        char *foo = " ";
+        for (int i = 0; i < size; i++)
+        {
+            foo[0] = data[i];
+            printf(foo);
+        }
+
+        if (size > 9 && data[0] == 'G' && data[1] == 'E' && data[2] == 'T' && data[3] == ' ' && data[4] == '/' && data[5] == ' ' && data[6] == 'H' && data[7] == 'T' && data[8] == 'T' && data[9] == 'P')
+        {
+            socket->Send((uint8_t *)"HTTP/1.1 200 OK\r\nServer: MyOS\r\nContent-Type: text/html\r\n\r\n<html><head><title>My Operating System</title></head><body><b>My Operating System</b> http://www.AlgorithMan.de</body></html>\r\n", 184);
+            socket->Disconnect();
+        }
+
+        return true;
+    }
+};
+
+void sysprintf(char *str)
+{
+    asm("int $0x80" : : "a"(4), "b"(str));
+}
+
+/*-------------------*/
+/*---===HW CODE===---*/
+
+/**
+ * @brief Forks a new task
+ *
+ * @param esp The current stack pointer
+ * @return int The new task id
+ */
+int __fork(uint32_t esp)
+{
+    return taskManager.fork(esp);
+}
+
+/**
+ * @brief Waits for a task to finish
+ *
+ * @return int The pid of the child for the parent, 0 for the child
+ */
+#define fork()               \
+    ({                       \
+        uint32_t result;     \
+        asm("int $0x80;"     \
+            "mov %0, %%eax;" \
+            : "=r"(result)   \
+            : "a"(2));       \
+        result;              \
+    })
+
+/**
+ * @brief Waits for a task to finish
+ *
+ * @param pid The pid of the task to wait for
+ */
+#define waitpid(pid)                           \
+    ({                                         \
+        asm("int $0x20" : : "a"(7), "b"(pid)); \
+    })
+
+#define waitpids(pids, n)                                      \
+    ({                                                         \
+        for (int i = 0; i < n; i++)                            \
+        {                                                      \
+            taskManager.GetCurrentTask()->locals[i] = pids[i]; \
+        }                                                      \
+        for (int i = 0; i < n; i++)                            \
+        {                                                      \
+            waitpid(taskManager.GetCurrentTask()->locals[i]);  \
+        }                                                      \
+    })
+
+/**
+ * @brief Exits the current task
+ */
+#define exit()                     \
+    {                              \
+        asm("int $0x20" ::"a"(1)); \
+    }
+
+/**
+ * @brief Executes a new task
+ *
+ * @param entrypoint The entrypoint of the new task
+ */
+void execve(void entrypoint())
+{
+    Task *task = new Task(&gdt, entrypoint);
+    taskManager.AddTask(task);
+    waitpid(task->GetID());
+    exit();
+}
+
+/**
+ * @brief Prints the Collatz sequence for the numbers from 1 to 100
+ */
+void collatz_sequence()
+{
+    printf("Collatz sequence\n");
+    int length = 100;
+    int start = 1;
+    int finish = start + length;
+    for (int i = start; i < finish; i++)
+    {
+        printf("Output ");
+        printfHex(i);
+        printf(": ");
+
+        int n = i;
+        while (n != 1)
+        {
+            if (n % 2 == 0)
+            {
+                n = n / 2;
+            }
+            else
+            {
+                n = (3 * n) + 1;
+            }
+            printfHex(n);
+            printf(", ");
+        }
+        printf("\n");
+    }
+    printf("Collatz finished!\n");
+    exit();
+}
+
+/**
+ * @brief A long running program
+ */
+void long_running_program()
+{
+    printf("Long running program\n");
+    int n = 1000;
+    int result = 0;
+    for (int i = 0; i < n; i++)
+    {
+        for (int j = 0; j < n; j++)
+        {
+            result += i * j;
+        }
+    }
+    printf("Long running program result for n=");
+    printfHex32(n);
+    printf(": ");
+    printfHex32(result);
+    printf("\n");
+    exit();
+}
+
+// Function to perform Binary Search
+void binarySearch()
+{
+    printf("Binary Search\n");
+    int arr[] = {1, 3, 5, 7, 9, 11, 13, 15};
+    int x = 9;
+    int size = 8;
+
+    printf("Array: ");
+    for (int i = 0; i < size; i++)
+    {
+        printfHex(arr[i]);
+        printf(", ");
+    }
+    printf("\n");
+
+    printf("Search for: ");
+    printfHex(x);
+    printf("\n");
+
+    int result = -1;
+    int left = 0, right = size - 1;
+    while (left <= right)
+    {
+        int mid = left + (right - left) / 2;
+        if (arr[mid] == x)
+        {
+            result = mid;
+            break;
+        }
+        if (arr[mid] < x)
+        {
+            left = mid + 1;
+        }
+        else
+        {
+            right = mid - 1;
+        }
+    }
+
+    printf("Binary Search result: ");
+    printfHex(result);
+    printf("\n");
+    exit();
+}
+
+// Function to perform Linear Search
+void linearSearch()
+{
+    printf("Linear Search\n");
+    int arr[] = {10, 20, 80, 30, 60, 50, 110, 100, 130, 170};
+    int x = 175;
+    int size = 10;
+
+    printf("Array: ");
+    for (int i = 0; i < size; i++)
+    {
+        printfHex(arr[i]);
+        printf(", ");
+    }
+    printf("\n");
+
+    printf("Search for: ");
+    printfHex(x);
+    printf("\n");
+
+    int result = -1;
+    for (int i = 0; i < size; i++)
+    {
+        if (arr[i] == x)
+            result = i;
+    }
+
+    printf("Linear Search result: ");
+    printfHex(result);
+    printf("\n");
+    exit();
+}
+
+/*---------------------------------*/
+
+RandomNumberGenerator rng(0x1234, 0x5000);
+/**
+ * @brief The init task of the kernel
+ */
+void init1()
+{
+    printf("First strategy\n");
+
+    int pids[10];
+
+    void (*functions[4])() = {collatz_sequence, long_running_program, binarySearch, linearSearch};
+    int random = rng.NextInt() % 4;
+
+    pids[0] = fork();
+    if (pids[0] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[1] = fork();
+    if (pids[1] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[2] = fork();
+    if (pids[2] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[3] = fork();
+    if (pids[3] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[4] = fork();
+    if (pids[4] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[5] = fork();
+    if (pids[5] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[6] = fork();
+    if (pids[6] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[7] = fork();
+    if (pids[7] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[8] = fork();
+    if (pids[8] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    pids[9] = fork();
+    if (pids[9] == 0)
+    {
+        execve(functions[random]);
+    }
+
+    printf("Waiting for first strategy tasks to finish...\n");
+    waitpids(pids, 10);
+    printf("All first strategy tasks finished!\n");
+
+    exit();
+}
+
+void init2()
+{
+    printf("Second strategy\n");
+
+    int pids[6];
+
+    void (*functions[4])() = {collatz_sequence, long_running_program, binarySearch, linearSearch};
+    int random1 = rng.NextInt() % 4;
+    int random2 = rng.NextInt() % 4;
+
+    pids[0] = fork();
+    if (pids[0] == 0)
+    {
+        execve(functions[random1]);
+    }
+
+    pids[1] = fork();
+    if (pids[1] == 0)
+    {
+        execve(functions[random1]);
+    }
+
+    pids[2] = fork();
+    if (pids[2] == 0)
+    {
+        execve(functions[random1]);
+    }
+
+    pids[3] = fork();
+    if (pids[3] == 0)
+    {
+        execve(functions[random2]);
+    }
+
+    pids[4] = fork();
+    if (pids[4] == 0)
+    {
+        execve(functions[random2]);
+    }
+
+    pids[5] = fork();
+    if (pids[5] == 0)
+    {
+        execve(functions[random2]);
+    }
+
+    printf("Waiting for second strategy tasks to finish...\n");
+    waitpids(pids, 6);
+    printf("All second strategy tasks finished!\n");
+    exit();
+}
+
+void init3()
+{
+    printf("Third strategy\n");
+    taskManager.HavePriority();
+
+    if (fork() == 0)
+    {
+        execve(collatz_sequence);
+    }
+
+    taskManager.GetCurrentTask()->SetPriority(1);
+
+    if (fork() == 0)
+    {
+        execve(long_running_program);
+    }
+
+    if (fork() == 0)
+    {
+        execve(binarySearch);
+    }
+
+    if (fork() == 0)
+    {
+        execve(linearSearch);
+    }
+
+    taskManager.DontHavePriority();
+    printf("Third strategy finished!\n");
+    exit();
+}
+
+void init4()
+{
+    printf("Fourth Strategy is not implemented\n");
+    exit();
+}
+
+void init()
+{
+    printf("Starting strategies...\n");
+    int pids[4];
+
+    printf("Starting first strategy in parallel\n");
+    pids[0] = fork();
+    if (pids[0] == 0)
+    {
+        execve(init1);
+    }
+
+    printf("Starting second strategy in parallel\n");
+    pids[1] = fork();
+    if (pids[1] == 0)
+    {
+        execve(init2);
+    }
+
+    printf("Starting third strategy in parallel\n");
+    pids[2] = fork();
+    if (pids[2] == 0)
+    {
+        execve(init3);
+    }
+
+    printf("Starting fourth strategy in parallel\n");
+    pids[3] = fork();
+    if (pids[3] == 0)
+    {
+        execve(init4);
+    }
+
+    printf("Waiting for strategies to finish...\n");
+    waitpids(pids, 4);
+    printf("All strategies finished!\n");
+
+    exit();
+}
+
+/*---===HW CODE===---*/
+/*-------------------*/
+
+typedef void (*constructor)();
+extern "C" constructor start_ctors;
+extern "C" constructor end_ctors;
+extern "C" void callConstructors()
+{
+    for (constructor *i = &start_ctors; i != &end_ctors; i++)
+        (*i)();
+}
+
+extern "C" void kernelMain(const void *multiboot_structure, uint32_t /*multiboot_magic*/)
+{
+
+    uint32_t *memupper = (uint32_t *)(((size_t)multiboot_structure) + 8);
+    size_t heap = 10 * 1024 * 1024;
+    MemoryManager memoryManager(heap, (*memupper) * 1024 - heap - 10 * 1024);
+    void *allocated = memoryManager.malloc(1024);
+
+    Task *init_task = new Task(&gdt, init);
+    taskManager.AddTask(init_task);
+
+    InterruptManager interrupts(0x20, &gdt, &taskManager);
+    SyscallHandler syscalls(&interrupts, 0x80);
+
+    // printf("Initializing Hardware, Stage 1\n");
+
+#ifdef GRAPHICSMODE
+    Desktop desktop(320, 200, 0x00, 0x00, 0xA8);
+#endif
+
+    DriverManager drvManager;
+
+#ifdef GRAPHICSMODE
+    KeyboardDriver keyboard(&interrupts, &desktop);
+#else
+    PrintfKeyboardEventHandler kbhandler;
+    KeyboardDriver keyboard(&interrupts, &kbhandler);
+#endif
+    drvManager.AddDriver(&keyboard);
+
+#ifdef GRAPHICSMODE
+    MouseDriver mouse(&interrupts, &desktop);
+#else
+    MouseToConsole mousehandler;
+    MouseDriver mouse(&interrupts, &mousehandler);
+#endif
+    drvManager.AddDriver(&mouse);
+
+    PeripheralComponentInterconnectController PCIController;
+    PCIController.SelectDrivers(&drvManager, &interrupts);
+
+#ifdef GRAPHICSMODE
+    VideoGraphicsArray vga;
+#endif
+
+    // printf("Initializing Hardware, Stage 2\n");
+    drvManager.ActivateAll();
+
+    // printf("Initializing Hardware, Stage 3\n");
+
+#ifdef GRAPHICSMODE
+    vga.SetMode(320, 200, 8);
+    Window win1(&desktop, 10, 10, 20, 20, 0xA8, 0x00, 0x00);
+    desktop.AddChild(&win1);
+    Window win2(&desktop, 40, 15, 30, 30, 0x00, 0xA8, 0x00);
+    desktop.AddChild(&win2);
+#endif
+
+    /*
+    printf("\nS-ATA primary master: ");
+    AdvancedTechnologyAttachment ata0m(true, 0x1F0);
+    ata0m.Identify();
+
+    printf("\nS-ATA primary slave: ");
+    AdvancedTechnologyAttachment ata0s(false, 0x1F0);
+    ata0s.Identify();
+    ata0s.Write28(0, (uint8_t*)"http://www.AlgorithMan.de", 25);
+    ata0s.Flush();
+    ata0s.Read28(0, 25);
+
+    printf("\nS-ATA secondary master: ");
+    AdvancedTechnologyAttachment ata1m(true, 0x170);
+    ata1m.Identify();
+
+    printf("\nS-ATA secondary slave: ");
+    AdvancedTechnologyAttachment ata1s(false, 0x170);
+    ata1s.Identify();
+    // third: 0x1E8
+    // fourth: 0x168
+    */
+
+    amd_am79c973 *eth0 = (amd_am79c973 *)(drvManager.drivers[2]);
+
+    // IP Address
+    uint8_t ip1 = 10, ip2 = 0, ip3 = 2, ip4 = 15;
+    uint32_t ip_be = ((uint32_t)ip4 << 24) | ((uint32_t)ip3 << 16) | ((uint32_t)ip2 << 8) | (uint32_t)ip1;
+    eth0->SetIPAddress(ip_be);
+    EtherFrameProvider etherframe(eth0);
+    AddressResolutionProtocol arp(&etherframe);
+
+    // IP Address of the default gateway
+    uint8_t gip1 = 10, gip2 = 0, gip3 = 2, gip4 = 2;
+    uint32_t gip_be = ((uint32_t)gip4 << 24) | ((uint32_t)gip3 << 16) | ((uint32_t)gip2 << 8) | (uint32_t)gip1;
+
+    uint8_t subnet1 = 255, subnet2 = 255, subnet3 = 255, subnet4 = 0;
+    uint32_t subnet_be = ((uint32_t)subnet4 << 24) | ((uint32_t)subnet3 << 16) | ((uint32_t)subnet2 << 8) | (uint32_t)subnet1;
+
+    InternetProtocolProvider ipv4(&etherframe, &arp, gip_be, subnet_be);
+    InternetControlMessageProtocol icmp(&ipv4);
+    UserDatagramProtocolProvider udp(&ipv4);
+    TransmissionControlProtocolProvider tcp(&ipv4);
+
+    interrupts.Activate();
+
+    while (1)
+    {
+#ifdef GRAPHICSMODE
+        desktop.Draw(&vga);
+#endif
+    }
+}
